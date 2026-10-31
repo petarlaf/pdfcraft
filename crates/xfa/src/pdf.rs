@@ -146,7 +146,7 @@ fn existing_fields(doc: &Document, catalog: &Dict) -> (HashMap<String, Signed>, 
         let kids = kids.as_deref().and_then(Object::as_array).map(Vec::as_slice).unwrap_or_default();
         if is_sig && let Some(value) = d.get(b"V").filter(|v| doc.resolve(v).as_dict().is_some()) {
             // The appearance is on the field when it is its own widget, or on its one widget.
-            let appearance = d.get(b"AP").cloned().or_else(|| kids.iter().find_map(|k| doc.resolve(k).as_dict().and_then(|k| k.get(b"AP").cloned())));
+            let appearance = d.get(b"AP").cloned().or_else(|| walk.find_map(kids, |k| doc.resolve(k).as_dict().and_then(|k| k.get(b"AP").cloned())));
             out.entry(name.clone()).or_insert(Signed { value: value.clone(), appearance });
         }
         if depth < MAX_FIELD_DEPTH {
@@ -168,6 +168,22 @@ struct FieldQueue {
 }
 
 impl FieldQueue {
+    /// The first of `kids` for which `f` gives a value. The entries looked at count against
+    /// [`MAX_KIDS_READ`] like those queued: signed fields sharing one long `/Kids` would
+    /// otherwise each search all of it. Past the limit nothing more is looked at.
+    fn find_map<T>(&mut self, kids: &[Object], mut f: impl FnMut(&Object) -> Option<T>) -> Option<T> {
+        for k in kids {
+            self.read += 1;
+            if self.read > MAX_KIDS_READ {
+                return None;
+            }
+            if let Some(v) = f(k) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
     /// Queue the fields `kids` lists, each the first time it is listed. Fields and kids are
     /// indirect references (ISO 32000-2 §12.7.3.1); anything else is skipped. A field listed
     /// again, by this list or another, under any generation, takes no room, and at most
@@ -1055,6 +1071,34 @@ mod tests {
         let (signed, names) = existing(&doc, fields);
         assert!(signed.contains_key("c.sig"), "{:?}", signed.keys().collect::<Vec<_>>());
         assert!(names.contains("c.plain"));
+    }
+
+    #[test]
+    fn signed_fields_sharing_one_long_kids_array_search_it_within_the_read_limit() {
+        // 1,000 signed fields share one `/Kids` array of 100,000 nulls and a widget with an
+        // appearance at its end. Each searched the whole array for that appearance: with a
+        // million nulls, a billion lookups (39 s). The search counts against `MAX_KIDS_READ`, so
+        // the fields read once it is spent keep their value but get no appearance.
+        let mut doc = Document::new_empty();
+        let mut widget = Dict::new();
+        widget.set(b"AP".to_vec(), Object::Dict(Dict::new()));
+        let mut shared = vec![Object::Null; 100_000];
+        shared.push(Object::Ref(doc.add(Object::Dict(widget))));
+        let kids = doc.add(Object::Array(shared));
+        let fields = (0..1_000)
+            .map(|i| {
+                let mut d = Dict::new();
+                d.set(b"T".to_vec(), Object::String(PdfString::literal(format!("s{i}").as_str())));
+                d.set(b"FT".to_vec(), Object::Name(b"Sig".to_vec()));
+                d.set(b"V".to_vec(), Object::Dict(Dict::new()));
+                d.set(b"Kids".to_vec(), Object::Ref(kids));
+                Object::Ref(doc.add(Object::Dict(d)))
+            })
+            .collect();
+        let (signed, _) = existing(&doc, fields);
+        assert_eq!(signed.len(), 1_000);
+        let with_appearance = signed.values().filter(|s| s.appearance.is_some()).count();
+        assert!((1..=10).contains(&with_appearance), "{with_appearance} appearances found");
     }
 
     /// Field `c` with two kids: `plain`, and `sig`, a signed signature field.
